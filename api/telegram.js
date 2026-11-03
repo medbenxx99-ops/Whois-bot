@@ -1,3 +1,4 @@
+import tls from "node:tls";
 import { normalizeDomain } from "../lib/domain.js";
 import { getUsage, lookupDomain } from "../lib/whois.js";
 import { getPortfolio, addPortfolioDomain, updatePortfolioDomain, removePortfolioDomain } from "../lib/portfolio.js";
@@ -21,6 +22,8 @@ function domainKeyboard(domain) {
   return { inline_keyboard: [
     [{ text: "🔎 WHOIS", callback_data: `whois:${domain}` }, { text: "➕ إضافة للمحفظة", callback_data: `add:${domain}` }],
     [{ text: "📂 محفظتي", callback_data: "portfolio" }, { text: "📊 الاستهلاك", callback_data: "usage" }],
+    [{ text: "🌐 DNS", callback_data: `dns:${domain}` }, { text: "🔐 SSL", callback_data: `ssl:${domain}` }],
+    [{ text: "💰 تقييم الاسم", callback_data: `value:${domain}` }, { text: "📈 الربح المتوقع", callback_data: `profit:${domain}` }],
     [{ text: "❓ المساعدة", callback_data: "help" }]
   ] };
 }
@@ -118,6 +121,52 @@ function optionalMoney(value, label) {
   return { value: n };
 }
 
+
+async function dnsReport(domain) {
+  async function lookup(type) {
+    const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`, { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`DNS lookup failed (${response.status})`);
+    const body = await response.json();
+    return (body.Answer || []).map(x => x.data).filter(Boolean);
+  }
+  const types = ["A", "AAAA", "MX", "NS", "TXT"];
+  const results = await Promise.all(types.map(async type => { try { return [type, await lookup(type)]; } catch { return [type, []]; } }));
+  return `🌐 <b>DNS: ${html(domain)}</b>\n\n` + results.map(([type, values]) => `<b>${type}:</b> ${html(values.length ? values.join(", ") : "غير متاح")}`).join("\n");
+}
+
+function sslReport(domain) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => { if (!settled) { settled = true; resolve(value); } };
+    const socket = tls.connect({ host: domain, port: 443, servername: domain, rejectUnauthorized: false, timeout: 7000 }, () => {
+      const cert = socket.getPeerCertificate();
+      const validFrom = cert?.valid_from ? new Date(cert.valid_from) : null;
+      const validTo = cert?.valid_to ? new Date(cert.valid_to) : null;
+      const inDate = validFrom && validTo && Date.now() >= validFrom.getTime() && Date.now() <= validTo.getTime();
+      finish([`🔐 <b>SSL: ${html(domain)}</b>`, `الحالة: ${socket.authorized && inDate ? "✅ صالح وموثوق" : inDate ? "⚠️ الشهادة ضمن المدة لكن سلسلة الثقة غير مؤكدة" : "❌ غير صالح أو منتهي"}`, `يبدأ: ${html(validFrom ? validFrom.toISOString() : "غير متاح")}`, `ينتهي: ${html(validTo ? validTo.toISOString() : "غير متاح")}`, `الجهة المصدرة: ${html(cert?.issuer?.O || cert?.issuer?.CN || "غير متاح")}`].join("\n"));
+      socket.end();
+    });
+    socket.on("error", () => finish(`🔐 <b>SSL: ${html(domain)}</b>\n⚠️ تعذر الاتصال بخادم HTTPS على المنفذ 443.`));
+    socket.on("timeout", () => { socket.destroy(); finish(`🔐 <b>SSL: ${html(domain)}</b>\n⏱️ انتهت مهلة الاتصال.`); });
+  });
+}
+
+async function valueReport(domain) {
+  const name = domain.split(".")[0];
+  const length = name.length;
+  const vowels = (name.match(/[aeiou]/gi) || []).length;
+  const score = Math.max(1, Math.min(10, Math.round((length <= 5 ? 4 : length <= 8 ? 3 : 1) + (vowels >= 2 ? 2 : vowels === 1 ? 1 : 0) + (/^[a-z]+$/i.test(name) ? 1 : 0) + (/[aeiou][bcdfghjklmnpqrstvwxyz]/i.test(name) ? 1 : 0) + (length <= 6 ? 1 : 0))));
+  return `💰 <b>مؤشر العلامة التجارية: ${html(domain)}</b>\n\nمؤشر آلي أولي: <b>${score}/10</b>\nطول الاسم: ${length} أحرف\nحروف العلة: ${vowels}\n\n⚠️ هذا مؤشر شكلي مبسط وليس تقييماً مالياً أو سعراً سوقياً. لا توجد مبيعات مقارنة موثقة ضمن هذا الفحص. افحص العلامات التجارية قبل الشراء أو البيع.`;
+}
+
+async function profitReport(domain) {
+  const item = (await getPortfolio()).find(x => x.domain.toLowerCase() === domain.toLowerCase());
+  if (!item) return `📈 <b>الربح المتوقع: ${html(domain)}</b>\n\nهذا الدومين غير موجود في محفظتك. أضفه أولاً من زر «إضافة للمحفظة».`;
+  const buy = Number(item.buyPrice || 0), target = Number(item.targetPrice || 0), renewal = Number(item.renewalCost || 0);
+  if (!target) return `📈 <b>الربح المتوقع: ${html(domain)}</b>\n\nلم تحدد سعر البيع المستهدف بعد. استخدم:\n<code>/edit ${html(domain)} | targetPrice | 500</code>`;
+  return `📈 <b>سيناريو البيع: ${html(domain)}</b>\n\nسعر الشراء: ${money(buy)}\nالتجديد السنوي: ${money(renewal)}\nسعر البيع المستهدف: ${money(target)}\nالربح النظري قبل الرسوم: <b>${money(target-buy)}</b>\n\n<i>لا يشمل عمولات المنصات أو الضرائب أو تكاليف إضافية، وليس ضماناً للبيع بهذا السعر.</i>`;
+}
+
 async function formatWhois(domain, data, source) {
   const nameservers = (data.nameservers || []).map(n => n.ldh_name || n.name || "").filter(Boolean);
   const statuses = (data.statuses || []).join(", ") || "غير متاح";
@@ -184,6 +233,18 @@ export default async function handler(req, res) {
           const result = await addPortfolioDomain({ domain });
           await reply(chatId, result.error ? `⚠️ ${html(result.error)}` : `✅ تمت إضافة <b>${html(domain)}</b> إلى المحفظة. يمكنك تعديل سعر الشراء والتجديد لاحقاً باستخدام /edit.`);
         }
+      } else if (action.startsWith("dns:")) {
+        const domain = normalizeDomain(action.slice(4));
+        await reply(chatId, domain ? await dnsReport(domain) : "⚠️ اسم الدومين غير صحيح.");
+      } else if (action.startsWith("ssl:")) {
+        const domain = normalizeDomain(action.slice(4));
+        await reply(chatId, domain ? await sslReport(domain) : "⚠️ اسم الدومين غير صحيح.");
+      } else if (action.startsWith("value:")) {
+        const domain = normalizeDomain(action.slice(6));
+        await reply(chatId, domain ? await valueReport(domain) : "⚠️ اسم الدومين غير صحيح.");
+      } else if (action.startsWith("profit:")) {
+        const domain = normalizeDomain(action.slice(7));
+        await reply(chatId, domain ? await profitReport(domain) : "⚠️ اسم الدومين غير صحيح.");
       } else if (action === "portfolio") await reply(chatId, portfolioText(await getPortfolio()));
       else if (action === "usage") {
         const usage = await getUsage();
@@ -248,7 +309,7 @@ export default async function handler(req, res) {
     }
 
     if (text === "/start") {
-      await reply(chatId, ["👋 <b>مرحباً بك في WHOIS Bot الخاص بك</b>", "", "أرسل اسم الدومين مباشرة:", "<code>example.com</code> — بحث WHOIS مع أزرار تفاعلية", "أو استخدم:", "<code>/whois example.com</code> — البحث عن دومين", "<code>/usage</code> — رصيد الشهر", "<code>/portfolio</code> — عرض المحفظة", "<code>/add</code> — إضافة دومين", "<code>/edit</code> — تعديل بيانات", "<code>/remove</code> — حذف دومين", "<code>/help</code> — مساعدة المحفظة", "", "يتضمن التقرير عمر الدومين، الأيام المتبقية، التصنيف، وعناوين IPv4/IPv6.", "ملاحظة: النتائج المخزنة لا تستهلك رصيد WHOIS جديداً."].join("\n"));
+      await reply(chatId, ["👋 <b>مرحباً بك في WHOIS Bot الخاص بك</b>", "", "أرسل اسم الدومين مباشرة:", "<code>example.com</code> — بحث WHOIS مع أزرار تفاعلية", "أو استخدم:", "<code>/whois example.com</code> — البحث عن دومين", "<code>/usage</code> — رصيد الشهر", "<code>/portfolio</code> — عرض المحفظة", "<code>/add</code> — إضافة دومين", "<code>/edit</code> — تعديل بيانات", "<code>/remove</code> — حذف دومين", "<code>/help</code> — مساعدة المحفظة", "", "تتضمن الأزرار فحص WHOIS وDNS وSSL ومؤشر العلامة التجارية والربح المتوقع.", "ملاحظة: النتائج المخزنة لا تستهلك رصيد WHOIS جديداً."].join("\n"));
     } else if (text === "/usage") {
       const usage = await getUsage();
       await reply(chatId, `📊 <b>استهلاك ${new Date().toISOString().slice(0, 7)}</b>\n\nالمستخدم: ${usage.used}/${usage.limit}\nالمتبقي: ${usage.remaining}`);
