@@ -14,8 +14,18 @@ async function telegram(method, payload) {
   return response.json();
 }
 
-async function reply(chatId, text) {
-  return telegram("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true });
+async function reply(chatId, text, reply_markup) {
+  return telegram("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...(reply_markup ? { reply_markup } : {}) });
+}
+function domainKeyboard(domain) {
+  return { inline_keyboard: [
+    [{ text: "🔎 WHOIS", callback_data: `whois:${domain}` }, { text: "➕ إضافة للمحفظة", callback_data: `add:${domain}` }],
+    [{ text: "📂 محفظتي", callback_data: "portfolio" }, { text: "📊 الاستهلاك", callback_data: "usage" }],
+    [{ text: "❓ المساعدة", callback_data: "help" }]
+  ] };
+}
+async function answerCallback(id, text) {
+  return telegram("answerCallbackQuery", { callback_query_id: id, text });
 }
 
 function eventDate(data, action) {
@@ -143,13 +153,42 @@ export default async function handler(req, res) {
   const secret = req.headers["x-telegram-bot-api-secret-token"];
   if (!process.env.TELEGRAM_WEBHOOK_SECRET || secret !== process.env.TELEGRAM_WEBHOOK_SECRET) return res.status(401).send("Unauthorized");
   try {
-    const message = req.body?.message;
+    const callback = req.body?.callback_query;
+    const message = req.body?.message || callback?.message;
     const chatId = message?.chat?.id;
-    const userId = String(message?.from?.id || "");
-    const text = String(message?.text || "").trim();
+    const userId = String((req.body?.message?.from || callback?.from)?.id || "");
+    const text = String(req.body?.message?.text || "").trim();
     if (!message || !chatId) return res.status(200).json({ ok: true });
     if (userId !== String(process.env.TELEGRAM_ALLOWED_USER_ID || "")) {
       await reply(chatId, "⛔ هذا البوت خاص وغير مصرح لحسابك باستخدامه.");
+      return res.status(200).json({ ok: true });
+    }
+
+    // Inline menu actions
+    if (callback) {
+      const action = String(callback.data || "");
+      await answerCallback(callback.id, "جارٍ التنفيذ...");
+      if (action.startsWith("whois:")) {
+        const domain = normalizeDomain(action.slice(6));
+        if (!domain) await reply(chatId, "⚠️ اسم الدومين غير صحيح.");
+        else {
+          const result = await lookupDomain(domain);
+          if (result.kind === "rate") await reply(chatId, "⏱️ انتظر ثانية واحدة قبل البحث التالي.");
+          else if (result.kind === "limit") await reply(chatId, "🛑 وصلت إلى الحد الشهري (500 بحث).");
+          else await reply(chatId, await formatWhois(domain, result.data, result.kind), domainKeyboard(domain));
+        }
+      } else if (action.startsWith("add:")) {
+        const domain = normalizeDomain(action.slice(4));
+        if (!domain) await reply(chatId, "⚠️ اسم الدومين غير صحيح.");
+        else {
+          const result = await addPortfolioDomain({ domain });
+          await reply(chatId, result.error ? `⚠️ ${html(result.error)}` : `✅ تمت إضافة <b>${html(domain)}</b> إلى المحفظة. يمكنك تعديل سعر الشراء والتجديد لاحقاً باستخدام /edit.`);
+        }
+      } else if (action === "portfolio") await reply(chatId, portfolioText(await getPortfolio()));
+      else if (action === "usage") {
+        const usage = await getUsage();
+        await reply(chatId, `📊 <b>استهلاك ${new Date().toISOString().slice(0, 7)}</b>\n\nالمستخدم: ${usage.used}/${usage.limit}\nالمتبقي: ${usage.remaining}`);
+      } else if (action === "help") await reply(chatId, portfolioHelp());
       return res.status(200).json({ ok: true });
     }
 
@@ -209,7 +248,7 @@ export default async function handler(req, res) {
     }
 
     if (text === "/start") {
-      await reply(chatId, ["👋 <b>مرحباً بك في WHOIS Bot الخاص بك</b>", "", "أرسل:", "<code>/whois example.com</code> — البحث عن دومين", "<code>/usage</code> — رصيد الشهر", "<code>/portfolio</code> — عرض المحفظة", "<code>/add</code> — إضافة دومين", "<code>/edit</code> — تعديل بيانات", "<code>/remove</code> — حذف دومين", "<code>/help</code> — مساعدة المحفظة", "", "يتضمن التقرير عمر الدومين، الأيام المتبقية، التصنيف، وعناوين IPv4/IPv6.", "ملاحظة: النتائج المخزنة لا تستهلك رصيد WHOIS جديداً."].join("\n"));
+      await reply(chatId, ["👋 <b>مرحباً بك في WHOIS Bot الخاص بك</b>", "", "أرسل اسم الدومين مباشرة:", "<code>example.com</code> — بحث WHOIS مع أزرار تفاعلية", "أو استخدم:", "<code>/whois example.com</code> — البحث عن دومين", "<code>/usage</code> — رصيد الشهر", "<code>/portfolio</code> — عرض المحفظة", "<code>/add</code> — إضافة دومين", "<code>/edit</code> — تعديل بيانات", "<code>/remove</code> — حذف دومين", "<code>/help</code> — مساعدة المحفظة", "", "يتضمن التقرير عمر الدومين، الأيام المتبقية، التصنيف، وعناوين IPv4/IPv6.", "ملاحظة: النتائج المخزنة لا تستهلك رصيد WHOIS جديداً."].join("\n"));
     } else if (text === "/usage") {
       const usage = await getUsage();
       await reply(chatId, `📊 <b>استهلاك ${new Date().toISOString().slice(0, 7)}</b>\n\nالمستخدم: ${usage.used}/${usage.limit}\nالمتبقي: ${usage.remaining}`);
@@ -222,9 +261,18 @@ export default async function handler(req, res) {
         const result = await lookupDomain(domain);
         if (result.kind === "rate") await reply(chatId, "⏱️ انتظر ثانية واحدة قبل البحث التالي.");
         else if (result.kind === "limit") await reply(chatId, "🛑 وصلت إلى الحد الشهري (500 بحث).");
-        else await reply(chatId, await formatWhois(domain, result.data, result.kind));
+        else await reply(chatId, await formatWhois(domain, result.data, result.kind), domainKeyboard(domain));
       }
-    } else await reply(chatId, "استخدم /whois domain.com أو /usage");
+    } else {
+      const nakedDomain = normalizeDomain(text);
+      if (nakedDomain) {
+        await reply(chatId, `⏳ جارٍ البحث عن <b>${html(nakedDomain)}</b>...`);
+        const result = await lookupDomain(nakedDomain);
+        if (result.kind === "rate") await reply(chatId, "⏱️ انتظر ثانية واحدة قبل البحث التالي.");
+        else if (result.kind === "limit") await reply(chatId, "🛑 وصلت إلى الحد الشهري (500 بحث).");
+        else await reply(chatId, await formatWhois(nakedDomain, result.data, result.kind), domainKeyboard(nakedDomain));
+      } else await reply(chatId, "أرسل اسم الدومين فقط مثل <code>ebaio.com</code>، أو استخدم /help.");
+    }
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error("Webhook error:", error);
