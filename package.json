@@ -1,0 +1,12 @@
+{
+  "name": "whois-telegram-private-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "set-webhook": "node scripts/set-webhook.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.3"
+  }
+}
