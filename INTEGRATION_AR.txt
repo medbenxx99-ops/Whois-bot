@@ -1,0 +1,110 @@
+# دمج المرحلة الأولى في api/telegram.js
+
+## 1) أضف هذه الاستيرادات في أعلى الملف
+
+```js
+import {
+  getPortfolio,
+  addPortfolioDomain,
+  updatePortfolioDomain,
+  removePortfolioDomain
+} from "../lib/portfolio.js";
+```
+
+## 2) أضف هذه الدوال المساعدة قبل `export default async function handler`
+
+```js
+function money(value) {
+  return value == null ? "—" : `$${Number(value).toFixed(2)}`;
+}
+
+function portfolioText(items) {
+  if (!items.length) return "محفظتك فارغة حالياً. أضف أول دومين عبر /add";
+  const lines = items.map((x, i) =>
+    `${i + 1}. <b>${html(x.domain)}</b>\n` +
+    `شراء: ${money(x.buyPrice)} | التجديد: ${money(x.renewalCost)}\n` +
+    `تاريخ التجديد: ${html(x.renewalDate || "—")} | الهدف: ${money(x.targetPrice)}\n` +
+    `الحالة: ${html(x.status)}`
+  );
+  return `📁 <b>محفظتك (${items.length}/99)</b>\n\n${lines.join("\n\n")}`;
+}
+
+function helpPortfolio() {
+  return [
+    "📂 <b>إدارة محفظة الدومينات — USD</b>",
+    "",
+    "<code>/add domain.com | buyPrice | buyDate | registrar | renewalDate | renewalCost | targetPrice</code>",
+    "مثال: <code>/add example.com | 12 | 2026-10-01 | Namecheap | 2027-10-01 | 14 | 500</code>",
+    "",
+    "<code>/portfolio</code> — عرض المحفظة",
+    "<code>/edit domain.com | field | value</code> — تعديل حقل",
+    "الحقول: buyPrice, buyDate, registrar, renewalDate, renewalCost, targetPrice, status, saleChannel, salePrice, soldDate",
+    "الحالات: holding, listed, sold, dropped",
+    "<code>/remove domain.com</code> — حذف دومين",
+    "",
+    "قناة البيع: marketplace أو private",
+    "التواريخ بصيغة YYYY-MM-DD، والمبالغ بالدولار."
+  ].join("\n");
+}
+```
+
+## 3) أضف الفروع التالية داخل handler
+
+ضعها بعد شرط التحقق من `userId` المصرح به، وقبل فرع `/start` الحالي:
+
+```js
+if (text === "/portfolio") {
+  const items = await getPortfolio();
+  await reply(chatId, portfolioText(items));
+} else if (text === "/add" || text.startsWith("/add ")) {
+  const raw = text.replace(/^\/add(?:@\w+)?\s*/i, "");
+  const p = raw.split("|").map(x => x.trim());
+  if (p.length < 1 || !p[0]) {
+    await reply(chatId, helpPortfolio());
+  } else {
+    const result = await addPortfolioDomain({
+      domain: p[0],
+      buyPrice: p[1] === "" || p[1] == null ? null : Number(p[1]),
+      buyDate: p[2] || null,
+      registrar: p[3] || null,
+      renewalDate: p[4] || null,
+      renewalCost: p[5] === "" || p[5] == null ? null : Number(p[5]),
+      targetPrice: p[6] === "" || p[6] == null ? null : Number(p[6])
+    });
+    if (result.error) await reply(chatId, `⚠️ ${html(result.error)}`);
+    else await reply(chatId, `✅ أُضيف <b>${html(result.item.domain)}</b> إلى المحفظة. (${result.count}/99)`);
+  }
+} else if (text === "/edit" || text.startsWith("/edit ")) {
+  const raw = text.replace(/^\/edit(?:@\w+)?\s*/i, "");
+  const p = raw.split("|").map(x => x.trim());
+  if (p.length < 3) await reply(chatId, helpPortfolio());
+  else {
+    const result = await updatePortfolioDomain(p[0], p[1], p.slice(2).join("|"));
+    await reply(chatId, result.error ? `⚠️ ${html(result.error)}` : `✅ تم تحديث ${html(result.item.domain)}.`);
+  }
+} else if (text === "/remove" || text.startsWith("/remove ")) {
+  const domain = text.replace(/^\/remove(?:@\w+)?\s*/i, "").trim();
+  const result = await removePortfolioDomain(domain);
+  await reply(chatId, result.error ? `⚠️ ${html(result.error)}` : `🗑️ تم حذف الدومين. المتبقي: ${result.count}/99`);
+}
+```
+
+مهم: لا تحذف أو تستبدل فروع `/start` أو `/usage` أو `/whois` الموجودة. بعد إضافة الفروع، اترك `else if (text === "/start")` الحالي كما هو، وتأكد أن سلسلة `else if` الجديدة متصلة به بشكل صحيح. أسهل موضع آمن هو وضعها كفروع `else if` مباشرة قبل فرع `/start`، ثم إبقاء بقية السلسلة كما هي.
+
+## 4) حدّث رسالة المساعدة في /start
+
+أضف أسطر الأوامر التالية داخل نص `/start` الحالي:
+- `/portfolio` — عرض المحفظة
+- `/add` — إضافة دومين
+- `/edit` — تعديل بيانات دومين
+- `/remove` — حذف دومين
+
+## 5) النشر والاختبار
+
+1. أنشئ الملف الجديد `lib/portfolio.js` وضع محتوى الملف المرفق فيه.
+2. ادمج التعديلات أعلاه في `api/telegram.js` دون استبدال الملف كله.
+3. اعمل Commit ثم انتظر اكتمال Deploy في Vercel.
+4. اختبر بالترتيب: `/portfolio` ثم `/add example.com | 12 | 2026-10-01 | Namecheap | 2027-10-01 | 14 | 500` ثم `/portfolio`.
+5. اختبر `/whois example.com` و`/usage` للتأكد أن الأوامر القديمة ما زالت تعمل.
+
+هذه النسخة لا تفعّل التنبيهات التلقائية بعد؛ ذلك سيكون في مرحلة مستقلة. لا تُدخل أي مفاتيح أو Tokens في الملفات.
