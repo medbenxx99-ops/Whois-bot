@@ -1,5 +1,6 @@
 import { normalizeDomain } from "../lib/domain.js";
 import { getUsage, lookupDomain } from "../lib/whois.js";
+import { getPortfolio, addPortfolioDomain, updatePortfolioDomain, removePortfolioDomain } from "../lib/portfolio.js";
 
 const html = (value = "") => String(value).replace(/[&<>"]/g, c => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"
@@ -72,6 +73,41 @@ async function resolveIps(domain) {
   return { ipv4: [...new Set(a)], ipv6: [...new Set(aaaa)] };
 }
 
+
+function money(value) {
+  return value == null ? "—" : `$${Number(value).toFixed(2)}`;
+}
+function portfolioText(items) {
+  if (!items.length) return "📁 محفظتك فارغة حالياً. أضف دوميناً باستخدام /add.";
+  const rows = items.map((x, i) => [
+    `${i + 1}. <b>${html(x.domain)}</b>`,
+    `شراء: ${money(x.buyPrice)} | التجديد: ${money(x.renewalCost)}`,
+    `موعد التجديد: ${html(x.renewalDate || "—")} | الهدف: ${money(x.targetPrice)}`,
+    `الحالة: ${html(x.status)} | قناة البيع: ${html(x.saleChannel || "—")}`,
+    x.status === "sold" ? `سعر البيع: ${money(x.salePrice)} | تاريخ البيع: ${html(x.soldDate || "—")}` : ""
+  ].filter(Boolean).join("\n"));
+  return `📁 <b>محفظة الدومينات (${items.length}/99)</b>\n\n${rows.join("\n\n")}`;
+}
+function portfolioHelp() {
+  return [
+    "📂 <b>أوامر إدارة المحفظة — USD</b>", "",
+    "<code>/add domain.com | buyPrice | buyDate | registrar | renewalDate | renewalCost | targetPrice</code>",
+    "<code>/add example.com | 12 | 2026-10-01 | Namecheap | 2027-10-01 | 14 | 500</code>", "",
+    "<code>/portfolio</code> — عرض المحفظة",
+    "<code>/edit domain.com | field | value</code> — تعديل",
+    "<code>/remove domain.com</code> — حذف",
+    "الحقول: buyPrice, buyDate, registrar, renewalDate, renewalCost, targetPrice, status, saleChannel, salePrice, soldDate",
+    "الحالات: holding, listed, sold, dropped. قنوات البيع: marketplace أو private.",
+    "التواريخ YYYY-MM-DD والمبالغ بالدولار."
+  ].join("\n");
+}
+function optionalMoney(value, label) {
+  if (value == null || value === "") return { value: null };
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return { error: `قيمة ${label} يجب أن تكون رقماً موجباً أو صفراً.` };
+  return { value: n };
+}
+
 async function formatWhois(domain, data, source) {
   const nameservers = (data.nameservers || []).map(n => n.ldh_name || n.name || "").filter(Boolean);
   const statuses = (data.statuses || []).join(", ") || "غير متاح";
@@ -116,8 +152,64 @@ export default async function handler(req, res) {
       await reply(chatId, "⛔ هذا البوت خاص وغير مصرح لحسابك باستخدامه.");
       return res.status(200).json({ ok: true });
     }
+
+    // Domain Investor Pro — private portfolio commands
+    if (/^\/help(?:@\w+)?$/.test(text)) {
+      await reply(chatId, portfolioHelp());
+      return res.status(200).json({ ok: true });
+    }
+    if (/^\/portfolio(?:@\w+)?$/.test(text)) {
+      await reply(chatId, portfolioText(await getPortfolio()));
+      return res.status(200).json({ ok: true });
+    }
+    if (/^\/add(?:@\w+)?(?:\s|$)/i.test(text)) {
+      const p = text.replace(/^\/add(?:@\w+)?\s*/i, "").split("|").map(x => x.trim());
+      if (!p[0]) {
+        await reply(chatId, portfolioHelp());
+      } else {
+        const buy = optionalMoney(p[1], "سعر الشراء");
+        const renewal = optionalMoney(p[5], "تكلفة التجديد");
+        const target = optionalMoney(p[6], "سعر البيع المستهدف");
+        const invalid = buy.error || renewal.error || target.error;
+        if (invalid) await reply(chatId, `⚠️ ${html(invalid)}`);
+        else {
+          const result = await addPortfolioDomain({
+            domain: p[0], buyPrice: buy.value, buyDate: p[2] || null,
+            registrar: p[3] || null, renewalDate: p[4] || null,
+            renewalCost: renewal.value, targetPrice: target.value
+          });
+          await reply(chatId, result.error
+            ? `⚠️ ${html(result.error)}`
+            : `✅ تمت إضافة <b>${html(result.item.domain)}</b> إلى المحفظة (${result.count}/99).`);
+        }
+      }
+      return res.status(200).json({ ok: true });
+    }
+    if (/^\/edit(?:@\w+)?(?:\s|$)/i.test(text)) {
+      const p = text.replace(/^\/edit(?:@\w+)?\s*/i, "").split("|").map(x => x.trim());
+      if (p.length < 3) await reply(chatId, portfolioHelp());
+      else {
+        const result = await updatePortfolioDomain(p[0], p[1], p.slice(2).join("|"));
+        await reply(chatId, result.error
+          ? `⚠️ ${html(result.error)}`
+          : `✅ تم تحديث بيانات <b>${html(result.item.domain)}</b>.`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+    if (/^\/remove(?:@\w+)?(?:\s|$)/i.test(text)) {
+      const domain = text.replace(/^\/remove(?:@\w+)?\s*/i, "").trim();
+      if (!domain) await reply(chatId, portfolioHelp());
+      else {
+        const result = await removePortfolioDomain(domain);
+        await reply(chatId, result.error
+          ? `⚠️ ${html(result.error)}`
+          : `🗑️ تم حذف الدومين. المتبقي: ${result.count}/99.`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
     if (text === "/start") {
-      await reply(chatId, ["👋 <b>مرحباً بك في WHOIS Bot الخاص بك</b>", "", "أرسل:", "<code>/whois example.com</code> — البحث عن دومين", "<code>/usage</code> — رصيد الشهر", "", "يتضمن التقرير عمر الدومين، الأيام المتبقية، التصنيف، وعناوين IPv4/IPv6.", "ملاحظة: النتائج المخزنة لا تستهلك رصيد WHOIS جديداً."].join("\n"));
+      await reply(chatId, ["👋 <b>مرحباً بك في WHOIS Bot الخاص بك</b>", "", "أرسل:", "<code>/whois example.com</code> — البحث عن دومين", "<code>/usage</code> — رصيد الشهر", "<code>/portfolio</code> — عرض المحفظة", "<code>/add</code> — إضافة دومين", "<code>/edit</code> — تعديل بيانات", "<code>/remove</code> — حذف دومين", "<code>/help</code> — مساعدة المحفظة", "", "يتضمن التقرير عمر الدومين، الأيام المتبقية، التصنيف، وعناوين IPv4/IPv6.", "ملاحظة: النتائج المخزنة لا تستهلك رصيد WHOIS جديداً."].join("\n"));
     } else if (text === "/usage") {
       const usage = await getUsage();
       await reply(chatId, `📊 <b>استهلاك ${new Date().toISOString().slice(0, 7)}</b>\n\nالمستخدم: ${usage.used}/${usage.limit}\nالمتبقي: ${usage.remaining}`);
